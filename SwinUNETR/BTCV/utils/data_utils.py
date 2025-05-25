@@ -39,6 +39,7 @@ class Sampler(torch.utils.data.Sampler):
         self.total_size = self.num_samples * self.num_replicas
         indices = list(range(len(self.dataset)))
         self.valid_length = len(indices[self.rank : self.total_size : self.num_replicas])
+        print( self.num_samples)
 
     def __iter__(self):
         if self.shuffle:
@@ -64,7 +65,32 @@ class Sampler(torch.utils.data.Sampler):
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    ScaleIntensityRanged,
+    NormalizeIntensityd,
+    MapTransform,
+)
+import torch
 
+class ClipNormalizeD(MapTransform):
+    def __init__(self, keys, p_min, p_max, mean, std):
+        super().__init__(keys)
+        self.p_min = p_min
+        self.p_max = p_max
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.keys:
+            img = d[key]
+            img = torch.clip(img, self.p_min, self.p_max)
+            img = (img - self.mean) / self.std
+            d[key] = img
+        return d
 
 def get_loader(args):
     data_dir = args.data_dir
@@ -72,7 +98,7 @@ def get_loader(args):
     train_transform = transforms.Compose(
         [
             transforms.LoadImaged(keys=["image", "label"]),
-            transforms.AddChanneld(keys=["image", "label"]),
+            transforms.EnsureChannelFirstd(keys=["image", "label"]),
             transforms.Orientationd(keys=["image", "label"], axcodes="RAS"),
             transforms.Spacingd(
                 keys=["image", "label"], pixdim=(args.space_x, args.space_y, args.space_z), mode=("bilinear", "nearest")
@@ -90,6 +116,12 @@ def get_loader(args):
                 num_samples=4,
                 image_key="image",
                 image_threshold=0,
+                allow_smaller=True
+            ),
+            transforms.SpatialPadd(
+                keys=["image", "label"],
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                constant_values=0
             ),
             transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=0),
             transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=1),
@@ -103,7 +135,7 @@ def get_loader(args):
     val_transform = transforms.Compose(
         [
             transforms.LoadImaged(keys=["image", "label"]),
-            transforms.AddChanneld(keys=["image", "label"]),
+            transforms.EnsureChannelFirstd(keys=["image", "label"]),
             transforms.Orientationd(keys=["image", "label"], axcodes="RAS"),
             transforms.Spacingd(
                 keys=["image", "label"], pixdim=(args.space_x, args.space_y, args.space_z), mode=("bilinear", "nearest")
@@ -119,7 +151,7 @@ def get_loader(args):
     test_transform = transforms.Compose(
         [
             transforms.LoadImaged(keys=["image", "label"]),
-            transforms.AddChanneld(keys=["image", "label"]),
+            transforms.EnsureChannelFirstd(keys=["image", "label"]),
             # transforms.Orientationd(keys=["image"], axcodes="RAS"),
             transforms.Spacingd(keys="image", pixdim=(args.space_x, args.space_y, args.space_z), mode="bilinear"),
             transforms.ScaleIntensityRanged(
@@ -128,21 +160,50 @@ def get_loader(args):
             transforms.ToTensord(keys=["image", "label"]),
         ]
     )
-
+    infer_transform = transforms.Compose(
+        [
+            transforms.LoadImaged(keys=["image"]),
+            transforms.EnsureChannelFirstd(keys=["image"]),
+            # transforms.Orientationd(keys=["image"], axcodes="RAS"),
+            # transforms.Spacingd(keys="image", pixdim=(args.space_x, args.space_y, args.space_z), mode="bilinear"),
+            # transforms.ScaleIntensityRanged(
+            #     keys=["image"], a_min=-986.0, a_max=379.0, b_min=args.b_min, b_max=args.b_max, clip=True
+            # ),
+            ClipNormalizeD(keys=["image"], p_min=-986.0, p_max=379.0, mean=50.736, std=138.339),
+            # transforms.ToTensord(keys=["image"]),
+            transforms.EnsureTyped(keys=["image"]),  # Preserves metadata
+        ]
+    )
     if args.test_mode:
-        test_files = load_decathlon_datalist(datalist_json, True, "validation", base_dir=data_dir)
-        test_ds = data.Dataset(data=test_files, transform=test_transform)
-        test_sampler = Sampler(test_ds, shuffle=False) if args.distributed else None
-        test_loader = data.DataLoader(
-            test_ds,
-            batch_size=1,
-            shuffle=False,
-            num_workers=args.workers,
-            sampler=test_sampler,
-            pin_memory=True,
-            persistent_workers=True,
-        )
-        loader = test_loader
+        if args.test_set:
+            test_files = load_decathlon_datalist(datalist_json, True, "test", base_dir=data_dir)
+            test_ds = data.Dataset(data=test_files, transform=infer_transform)
+            test_sampler = Sampler(test_ds, shuffle=False) if args.distributed else None
+            test_loader = data.DataLoader(
+                test_ds,
+                batch_size=1,
+                shuffle=False,
+                num_workers=args.workers,
+                sampler=test_sampler,
+                pin_memory=True,
+                persistent_workers=True,
+            )
+            loader = test_loader
+        else:
+            test_files = load_decathlon_datalist(datalist_json, True, "validation", base_dir=data_dir)
+            test_ds = data.Dataset(data=test_files, transform=test_transform)
+            test_sampler = Sampler(test_ds, shuffle=False) if args.distributed else None
+            test_loader = data.DataLoader(
+                test_ds,
+                batch_size=1,
+                shuffle=False,
+                num_workers=args.workers,
+                sampler=test_sampler,
+                pin_memory=True,
+                persistent_workers=True,
+            )
+            loader = test_loader
+
     else:
         datalist = load_decathlon_datalist(datalist_json, True, "training", base_dir=data_dir)
         if args.use_normal_dataset:

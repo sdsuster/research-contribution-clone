@@ -12,6 +12,7 @@
 import os
 import shutil
 import time
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -28,12 +29,16 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args):
     model.train()
     start_time = time.time()
     run_loss = AverageMeter()
-    for idx, batch_data in enumerate(loader):
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]", disable=args.rank != 0)
+    for idx, batch_data in enumerate(pbar):
         if isinstance(batch_data, list):
             data, target = batch_data
         else:
             data, target = batch_data["image"], batch_data["label"]
         data, target = data.cuda(args.rank), target.cuda(args.rank)
+        with torch.no_grad():
+            target[target < 0] = 0
+
         for param in model.parameters():
             param.grad = None
         with autocast(enabled=args.amp):
@@ -55,11 +60,11 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args):
         else:
             run_loss.update(loss.item(), n=args.batch_size)
         if args.rank == 0:
-            print(
-                "Epoch {}/{} {}/{}".format(epoch, args.max_epochs, idx, len(loader)),
-                "loss: {:.4f}".format(run_loss.avg),
-                "time {:.2f}s".format(time.time() - start_time),
-            )
+            pbar.set_postfix({
+                "batch": f"{idx+1}/{len(loader)}",
+                "loss": f"{run_loss.avg:.4f}",
+                "time": f"{time.time() - start_time:.2f}s"
+            })
         start_time = time.time()
     for param in model.parameters():
         param.grad = None
@@ -71,12 +76,15 @@ def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_lab
     run_acc = AverageMeter()
     start_time = time.time()
     with torch.no_grad():
-        for idx, batch_data in enumerate(loader):
+        
+        pbar = tqdm(loader, desc=f"Epoch {epoch} [Val]", disable=args.rank != 0)
+        for idx, batch_data in enumerate(pbar):
             if isinstance(batch_data, list):
                 data, target = batch_data
             else:
                 data, target = batch_data["image"], batch_data["label"]
             data, target = data.cuda(args.rank), target.cuda(args.rank)
+            target[target < 0] = 0
             with autocast(enabled=args.amp):
                 if model_inferer is not None:
                     logits = model_inferer(data)
@@ -105,12 +113,11 @@ def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_lab
 
             if args.rank == 0:
                 avg_acc = np.mean(run_acc.avg)
-                print(
-                    "Val {}/{} {}/{}".format(epoch, args.max_epochs, idx, len(loader)),
-                    "acc",
-                    avg_acc,
-                    "time {:.2f}s".format(time.time() - start_time),
-                )
+                pbar.set_postfix({
+                    "batch": f"{idx+1}/{len(loader)}",
+                    "acc": f"{avg_acc:.4f}",
+                    "time": f"{time.time() - start_time:.2f}s"
+                })
             start_time = time.time()
     return run_acc.avg
 
@@ -154,7 +161,7 @@ def run_training(
         if args.distributed:
             train_loader.sampler.set_epoch(epoch)
             torch.distributed.barrier()
-        print(args.rank, time.ctime(), "Epoch:", epoch)
+        # print(args.rank, time.ctime(), "Epoch:", epoch)
         epoch_time = time.time()
         train_loss = train_epoch(
             model, train_loader, optimizer, scaler=scaler, epoch=epoch, loss_func=loss_func, args=args
@@ -164,6 +171,7 @@ def run_training(
                 "Final training  {}/{}".format(epoch, args.max_epochs - 1),
                 "loss: {:.4f}".format(train_loss),
                 "time {:.2f}s".format(time.time() - epoch_time),
+                time.ctime()
             )
         if args.rank == 0 and writer is not None:
             writer.add_scalar("train_loss", train_loss, epoch)

@@ -21,12 +21,12 @@ import torch.nn.parallel
 import torch.utils.data.distributed
 from optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from trainer import run_training
-from utils.data_utils import get_loader
 
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.networks.nets import SwinUNETR
+from swlin_unetr import SWlinUNETR
 from monai.transforms import Activations, AsDiscrete, Compose
 from monai.utils.enums import MetricReduction
 
@@ -47,7 +47,7 @@ parser.add_argument(
 parser.add_argument("--save_checkpoint", action="store_true", help="save checkpoint during training")
 parser.add_argument("--max_epochs", default=5000, type=int, help="max number of training epochs")
 parser.add_argument("--batch_size", default=1, type=int, help="number of batch size")
-parser.add_argument("--sw_batch_size", default=4, type=int, help="number of sliding window batch size")
+parser.add_argument("--sw_batch_size", default=2, type=int, help="number of sliding window batch size")
 parser.add_argument("--optim_lr", default=1e-4, type=float, help="optimization learning rate")
 parser.add_argument("--optim_name", default="adamw", type=str, help="optimization algorithm")
 parser.add_argument("--reg_weight", default=1e-5, type=float, help="regularization weight")
@@ -88,9 +88,11 @@ parser.add_argument("--resume_ckpt", action="store_true", help="resume training 
 parser.add_argument("--smooth_dr", default=1e-6, type=float, help="constant added to dice denominator to avoid nan")
 parser.add_argument("--smooth_nr", default=0.0, type=float, help="constant added to dice numerator to avoid zero")
 parser.add_argument("--use_checkpoint", action="store_true", help="use gradient checkpointing to save memory")
+parser.add_argument("--use_nnunet_dataset", action="store_true", help="use nnunet formatted dataset")
 parser.add_argument("--use_ssl_pretrained", action="store_true", help="use self-supervised pretrained weights")
 parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
 parser.add_argument("--squared_dice", action="store_true", help="use squared Dice")
+parser.add_argument("--use_wlin", default=-1, type=int, help="use wlin reduction")
 
 
 def main():
@@ -119,14 +121,19 @@ def main_worker(gpu, args):
     torch.cuda.set_device(args.gpu)
     torch.backends.cudnn.benchmark = True
     args.test_mode = False
-    loader = get_loader(args)
+    if args.use_nnunet_dataset:
+        from extensions.nnUNet.dataset import get_loader
+        loader = get_loader(args)
+    else:
+        from utils.data_utils import get_loader
+        loader = get_loader(args)
     print(args.rank, " gpu", args.gpu)
     if args.rank == 0:
         print("Batch size is:", args.batch_size, "epochs", args.max_epochs)
     inf_size = [args.roi_x, args.roi_y, args.roi_z]
 
     pretrained_dir = args.pretrained_dir
-    model = SwinUNETR(
+    model = SWlinUNETR(
         img_size=(args.roi_x, args.roi_y, args.roi_z),
         in_channels=args.in_channels,
         out_channels=args.out_channels,
@@ -135,6 +142,8 @@ def main_worker(gpu, args):
         attn_drop_rate=0.0,
         dropout_path_rate=args.dropout_path_rate,
         use_checkpoint=args.use_checkpoint,
+        use_wlin=args.use_wlin
+        
     )
 
     if args.resume_ckpt:
@@ -170,8 +179,8 @@ def main_worker(gpu, args):
         )
     else:
         dice_loss = DiceCELoss(to_onehot_y=True, softmax=True)
-    post_label = AsDiscrete(to_onehot=True, n_classes=args.out_channels)
-    post_pred = AsDiscrete(argmax=True, to_onehot=True, n_classes=args.out_channels)
+    post_label = AsDiscrete(to_onehot=args.out_channels)
+    post_pred = AsDiscrete(argmax=True, to_onehot=args.out_channels)
     dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN, get_not_nans=True)
     model_inferer = partial(
         sliding_window_inference,
