@@ -66,14 +66,10 @@ class Sampler(torch.utils.data.Sampler):
     def set_epoch(self, epoch):
         self.epoch = epoch
 from monai.transforms import (
-    Compose,
-    LoadImaged,
-    EnsureChannelFirstd,
-    ScaleIntensityRanged,
-    NormalizeIntensityd,
     MapTransform,
 )
-import torch
+
+
 
 class ClipNormalizeD(MapTransform):
     def __init__(self, keys, p_min, p_max, mean, std):
@@ -85,12 +81,48 @@ class ClipNormalizeD(MapTransform):
 
     def __call__(self, data):
         d = dict(data)
-        for key in self.keys:
-            img = d[key]
-            img = torch.clip(img, self.p_min, self.p_max)
-            img = (img - self.mean) / self.std
-            d[key] = img
+        with torch.no_grad():
+            for key in self.keys:
+                img = d[key]
+                img = torch.clip(img, self.p_min, self.p_max)
+                img = (img - self.mean) / self.std
+                d[key] = img
         return d
+class ClipNormalizeD2(MapTransform):
+    def __init__(self, keys, p_min, p_max, mean, std):
+        super().__init__(keys)
+        self.p_min = p_min
+        self.p_max = p_max
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, data):
+        d = dict(data)
+        with torch.no_grad():
+            for key in self.keys:
+                img = d[key]
+                img = torch.clip(img, self.p_min, self.p_max)
+                img = (img - self.mean) / self.std
+                # Min-max scale to [-1, 1]
+                img_min = img.amin()
+                img_max = img.amax()
+                if img_max != img_min:
+                    img = 2 * (img - img_min) / (img_max - img_min) - 1
+                else:
+                    img = torch.zeros_like(img)  # Avoid division by zero
+                d[key] = img
+        return d
+
+def make_image_list(folder_path, extensions=(".nii", ".nii.gz")):
+    folder_path = os.path.abspath(folder_path)
+
+    files = sorted(
+        [{"image": os.path.join(folder_path, f)} for f in os.listdir(folder_path) if f.endswith(extensions)],
+        key=lambda x: x["image"]
+    )
+
+    print(f"Found {len(files)} image files.")
+    return files
 
 def get_loader(args):
     data_dir = args.data_dir
@@ -106,6 +138,8 @@ def get_loader(args):
             transforms.ScaleIntensityRanged(
                 keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=args.b_min, b_max=args.b_max, clip=True
             ),
+            # ClipNormalizeD2(keys=["image"], p_min=-986.0, p_max=379.0, mean=50.736, std=138.339),
+            
             transforms.CropForegroundd(keys=["image", "label"], source_key="image"),
             transforms.RandCropByPosNegLabeld(
                 keys=["image", "label"],
@@ -113,23 +147,23 @@ def get_loader(args):
                 spatial_size=(args.roi_x, args.roi_y, args.roi_z),
                 pos=1,
                 neg=1,
-                num_samples=4,
+                num_samples=1,
                 image_key="image",
                 image_threshold=0,
-                allow_smaller=True
+                allow_smaller=False
             ),
             transforms.SpatialPadd(
                 keys=["image", "label"],
                 spatial_size=(args.roi_x, args.roi_y, args.roi_z),
                 constant_values=0
             ),
-            transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=0),
-            transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=1),
-            transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=2),
-            transforms.RandRotate90d(keys=["image", "label"], prob=args.RandRotate90d_prob, max_k=3),
-            transforms.RandScaleIntensityd(keys="image", factors=0.1, prob=args.RandScaleIntensityd_prob),
-            transforms.RandShiftIntensityd(keys="image", offsets=0.1, prob=args.RandShiftIntensityd_prob),
-            transforms.ToTensord(keys=["image", "label"]),
+            # transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=[0, 1, 2]),
+            # transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=1),
+            # transforms.RandFlipd(keys=["image", "label"], prob=args.RandFlipd_prob, spatial_axis=2),
+            # transforms.RandRotate90d(keys=["image", "label"], prob=args.RandRotate90d_prob, max_k=3),
+            # transforms.RandScaleIntensityd(keys="image", factors=0.1, prob=args.RandScaleIntensityd_prob),
+            # transforms.RandShiftIntensityd(keys="image", offsets=0.1, prob=args.RandShiftIntensityd_prob),
+            # transforms.ToTensord(keys=["image", "label"]),
         ]
     )
     val_transform = transforms.Compose(
@@ -143,6 +177,7 @@ def get_loader(args):
             transforms.ScaleIntensityRanged(
                 keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=args.b_min, b_max=args.b_max, clip=True
             ),
+            # ClipNormalizeD2(keys=["image"], p_min=-986.0, p_max=379.0, mean=50.736, std=138.339),
             transforms.CropForegroundd(keys=["image", "label"], source_key="image"),
             transforms.ToTensord(keys=["image", "label"]),
         ]
@@ -157,6 +192,7 @@ def get_loader(args):
             transforms.ScaleIntensityRanged(
                 keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=args.b_min, b_max=args.b_max, clip=True
             ),
+            # ClipNormalizeD2(keys=["image"], p_min=-986.0, p_max=379.0, mean=50.736, std=138.339),
             transforms.ToTensord(keys=["image", "label"]),
         ]
     )
@@ -165,18 +201,20 @@ def get_loader(args):
             transforms.LoadImaged(keys=["image"]),
             transforms.EnsureChannelFirstd(keys=["image"]),
             # transforms.Orientationd(keys=["image"], axcodes="RAS"),
-            # transforms.Spacingd(keys="image", pixdim=(args.space_x, args.space_y, args.space_z), mode="bilinear"),
-            # transforms.ScaleIntensityRanged(
-            #     keys=["image"], a_min=-986.0, a_max=379.0, b_min=args.b_min, b_max=args.b_max, clip=True
-            # ),
-            ClipNormalizeD(keys=["image"], p_min=-986.0, p_max=379.0, mean=50.736, std=138.339),
-            # transforms.ToTensord(keys=["image"]),
-            transforms.EnsureTyped(keys=["image"]),  # Preserves metadata
+            transforms.Spacingd(keys="image", pixdim=(args.space_x, args.space_y, args.space_z), mode="bilinear", align_corners=True),
+            transforms.ScaleIntensityRanged(
+                keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=args.b_min, b_max=args.b_max, clip=True
+            ),
+            # ClipNormalizeD2(keys=["image"], p_min=-986.0, p_max=379.0, mean=50.736, std=138.339),
+            transforms.ToTensord(keys=["image"]),
+            # transforms.EnsureTyped(keys=["image"]),  # Preserves metadata
         ]
     )
     if args.test_mode:
         if args.test_set:
-            test_files = load_decathlon_datalist(datalist_json, True, "test", base_dir=data_dir)
+            # test_files = load_decathlon_datalist(datalist_json, True, "test", base_dir=data_dir)
+            
+            test_files = make_image_list(args.data_dir)
             test_ds = data.Dataset(data=test_files, transform=infer_transform)
             test_sampler = Sampler(test_ds, shuffle=False) if args.distributed else None
             test_loader = data.DataLoader(
